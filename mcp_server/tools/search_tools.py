@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple, Union
 
 from ..services.data_service import DataService
-from ..utils.validators import validate_keyword, validate_limit, validate_threshold
+from ..utils.validators import validate_keyword, validate_limit, validate_threshold, normalize_date_range
 from ..utils.errors import MCPError, InvalidParameterError, DataNotFoundError
 
 
@@ -26,14 +26,6 @@ class SearchTools:
             project_root: 项目根目录
         """
         self.data_service = DataService(project_root)
-        # 中文停用词列表
-        self.stopwords = {
-            '的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都', '一',
-            '一个', '上', '也', '很', '到', '说', '要', '去', '你', '会', '着', '没有',
-            '看', '好', '自己', '这', '那', '来', '被', '与', '为', '对', '将', '从',
-            '以', '及', '等', '但', '或', '而', '于', '中', '由', '可', '可以', '已',
-            '已经', '还', '更', '最', '再', '因为', '所以', '如果', '虽然', '然而'
-        }
 
     def search_news_unified(
         self,
@@ -44,10 +36,12 @@ class SearchTools:
         limit: int = 50,
         sort_by: str = "relevance",
         threshold: float = 0.6,
-        include_url: bool = False
+        include_url: bool = False,
+        include_rss: bool = False,
+        rss_limit: int = 20
     ) -> Dict:
         """
-        统一新闻搜索工具 - 整合多种搜索模式
+        统一新闻搜索工具 - 整合多种搜索模式，支持同时搜索热榜和RSS
 
         Args:
             query: 查询内容（必需）- 关键词、内容片段或实体名称
@@ -61,21 +55,24 @@ class SearchTools:
                        - **默认**: 不指定时默认查询今天
                        - **注意**: start和end可以相同（表示单日查询）
             platforms: 平台过滤列表，如 ['zhihu', 'weibo']
-            limit: 返回条数限制，默认50
+            limit: 热榜返回条数限制，默认50
             sort_by: 排序方式，可选值：
                 - "relevance": 按相关度排序（默认）
                 - "weight": 按新闻权重排序
                 - "date": 按日期排序
             threshold: 相似度阈值（仅fuzzy模式有效），0-1之间，默认0.6
             include_url: 是否包含URL链接，默认False（节省token）
+            include_rss: 是否同时搜索RSS数据，默认False
+            rss_limit: RSS返回条数限制，默认20
 
         Returns:
-            搜索结果字典，包含匹配的新闻列表
+            搜索结果字典，包含匹配的新闻列表（热榜和RSS分开展示）
 
         Examples:
             - search_news_unified(query="人工智能", search_mode="keyword")
             - search_news_unified(query="特斯拉降价", search_mode="fuzzy", threshold=0.4)
             - search_news_unified(query="马斯克", search_mode="entity", limit=20)
+            - search_news_unified(query="AI", include_rss=True)  # 同时搜索热榜和RSS
             - search_news_unified(query="iPhone 16", date_range={"start": "2025-01-01", "end": "2025-01-07"})
         """
         try:
@@ -206,8 +203,9 @@ class SearchTools:
             result = {
                 "success": True,
                 "summary": {
+                    "description": f"新闻搜索结果（{search_mode}模式）",
                     "total_found": len(all_matches),
-                    "returned_count": len(results),
+                    "returned": len(results),
                     "requested_limit": limit,
                     "search_mode": search_mode,
                     "query": query,
@@ -215,13 +213,28 @@ class SearchTools:
                     "time_range": time_range_desc,
                     "sort_by": sort_by
                 },
-                "results": results
+                "data": results
             }
 
             if search_mode == "fuzzy":
                 result["summary"]["threshold"] = threshold
                 if len(all_matches) < limit:
                     result["note"] = f"模糊搜索模式下，相似度阈值 {threshold} 仅匹配到 {len(all_matches)} 条结果"
+
+            # 如果启用 RSS 搜索，同时搜索 RSS 数据
+            if include_rss:
+                rss_results = self._search_rss_by_keyword(
+                    query=query,
+                    start_date=start_date,
+                    end_date=end_date,
+                    limit=rss_limit,
+                    include_url=include_url
+                )
+                result["rss"] = rss_results["items"]
+                result["rss_total"] = rss_results["total"]
+                result["summary"]["include_rss"] = True
+                result["summary"]["rss_found"] = rss_results["total"]
+                result["summary"]["rss_returned"] = len(rss_results["items"])
 
             return result
 
@@ -457,11 +470,8 @@ class SearchTools:
         # 使用正则表达式分词（中文和英文）
         words = re.findall(r'[\w]+', text)
 
-        # 过滤停用词和短词
-        keywords = [
-            word for word in words
-            if word and len(word) >= min_length and word not in self.stopwords
-        ]
+        # 过滤短词
+        keywords = [word for word in words if word and len(word) >= min_length]
 
         return keywords
 
@@ -683,8 +693,9 @@ class SearchTools:
             result = {
                 "success": True,
                 "summary": {
+                    "description": "历史相关新闻搜索结果",
                     "total_found": len(all_related_news),
-                    "returned_count": len(results),
+                    "returned": len(results),
                     "requested_limit": limit,
                     "threshold": threshold,
                     "reference_title": reference_title,
@@ -695,7 +706,7 @@ class SearchTools:
                         "end": search_end.strftime("%Y-%m-%d")
                     }
                 },
-                "results": results,
+                "data": results,
                 "statistics": {
                     "platform_distribution": dict(platform_distribution),
                     "date_distribution": dict(date_distribution),
@@ -760,7 +771,10 @@ class SearchTools:
 
             # 确定日期范围
             today = datetime.now()
-            
+
+            # 规范化 date_range（处理 JSON 字符串序列化问题）
+            date_range = normalize_date_range(date_range)
+
             if date_range is None or date_range == "today":
                 # 只查询今天
                 search_dates = [today]
@@ -858,8 +872,9 @@ class SearchTools:
             return {
                 "success": True,
                 "summary": {
+                    "description": "相关新闻搜索结果",
                     "total_found": len(all_related_news),
-                    "returned_count": len(results),
+                    "returned": len(results),
                     "reference_title": reference_title,
                     "threshold": threshold,
                     "date_range": {
@@ -867,7 +882,7 @@ class SearchTools:
                         "end": max(search_dates).strftime("%Y-%m-%d")
                     } if search_dates else None
                 },
-                "results": results,
+                "data": results,
                 "statistics": {
                     "platform_distribution": dict(platform_dist),
                     "date_distribution": dict(date_dist)
@@ -878,3 +893,79 @@ class SearchTools:
             return {"success": False, "error": e.to_dict()}
         except Exception as e:
             return {"success": False, "error": {"code": "INTERNAL_ERROR", "message": str(e)}}
+
+    def _search_rss_by_keyword(
+        self,
+        query: str,
+        start_date: datetime,
+        end_date: datetime,
+        limit: int = 20,
+        include_url: bool = False
+    ) -> Dict:
+        """
+        在 RSS 数据中搜索关键词
+
+        Args:
+            query: 搜索关键词
+            start_date: 开始日期
+            end_date: 结束日期
+            limit: 返回条数限制
+            include_url: 是否包含 URL
+
+        Returns:
+            RSS 搜索结果字典
+        """
+        all_rss_matches = []
+        query_lower = query.lower()
+        current_date = start_date
+
+        while current_date <= end_date:
+            try:
+                # 读取该日期的 RSS 数据
+                all_titles, id_to_name, _ = self.data_service.parser.read_all_titles_for_date(
+                    date=current_date,
+                    platform_ids=None,
+                    db_type="rss"
+                )
+
+                for feed_id, items in all_titles.items():
+                    feed_name = id_to_name.get(feed_id, feed_id)
+
+                    for title, info in items.items():
+                        # 关键词匹配（标题或摘要）
+                        title_match = query_lower in title.lower()
+                        summary = info.get("summary", "")
+                        summary_match = query_lower in summary.lower() if summary else False
+
+                        if title_match or summary_match:
+                            rss_item = {
+                                "title": title,
+                                "feed_id": feed_id,
+                                "feed_name": feed_name,
+                                "date": current_date.strftime("%Y-%m-%d"),
+                                "published_at": info.get("published_at", ""),
+                                "author": info.get("author", ""),
+                                "match_in": "title" if title_match else "summary"
+                            }
+
+                            if include_url:
+                                rss_item["url"] = info.get("url", "")
+
+                            all_rss_matches.append(rss_item)
+
+            except DataNotFoundError:
+                # 该日期没有 RSS 数据，继续下一天
+                pass
+            except Exception:
+                # 其他错误，跳过
+                pass
+
+            current_date += timedelta(days=1)
+
+        # 按发布时间排序（最新的在前）
+        all_rss_matches.sort(key=lambda x: x.get("published_at", ""), reverse=True)
+
+        return {
+            "items": all_rss_matches[:limit],
+            "total": len(all_rss_matches)
+        }
